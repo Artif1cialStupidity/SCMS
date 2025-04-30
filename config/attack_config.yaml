@@ -1,0 +1,49 @@
+# config/attack_config.yaml
+# Configuration for running the Model Stealing Attack
+
+# General Setup
+seed: 43                # 攻击者的随机种子 (int, 建议与受害者不同)
+
+# Attacker Configuration Block
+attacker:
+  # Attack Strategy Configuration
+  type: steal_end2end   # 攻击目标类型
+                        # 可选: 'steal_encoder' (窃取编码器 X -> z)
+                        #      'steal_decoder' (窃取解码器 z' -> Y)
+                        #      'steal_end2end' (窃取端到端功能 X -> Y)
+  query_access: end_to_end_query # 攻击者可以使用的查询接口类型
+                        # 可选: 'encoder_query' (输入X, 获取z)
+                        #      'decoder_query' (输入z', 获取Y)
+                        #      'end_to_end_query' (输入X, 获取Y)
+  latent_access: none   # 攻击者是否能额外获取潜在变量 (灰盒)
+                        # 可选: 'none' (纯黑盒)
+                        #      'clean_z' (获取编码器输出的干净 z)
+                        #      'dirty_z_prime' (获取经过信道的 z')
+  query_budget: 10000   # 允许攻击者向受害者模型查询的总样本数 (int)
+
+  # Surrogate Model Architecture Configuration (攻击者用来模仿的模型)
+  surrogate_model:
+    arch_name: resnet18 # 替代模型使用的架构 (可以与受害者相同或不同)
+                        # e.g., 'resnet18', 'resnet34'
+    latent_dim: 64      # 替代模型假设或使用的潜在维度 (int)
+                        # 如果窃取编码器/解码器，通常应与受害者匹配
+                        # 如果窃取端到端，此维度是替代模型内部的，不一定需匹配
+    # task: reconstruction # 这个通常会从 victim_config.yaml 继承, 无需在此显式设置
+    # num_classes: 10    # 这个通常会从 victim_config.yaml 继承, 无需在此显式设置
+    # dropout: 0.5       # 如果替代解码器是MLP分类头, 可以设置
+
+  # Surrogate Model Training Configuration
+  training_attacker:
+    lr: 0.001             # 替代模型的学习率 (float)
+    batch_size: 128       # 训练替代模型的批次大小 (使用收集的数据) (int)
+    epochs: 15            # 训练替代模型的轮数 (int)
+                        # 也可以不设置epochs, 而是在达到query_budget后停止查询并训练一次
+    query_batch_size: 256 # 每次调用 victim_interface.query 时使用的批次大小 (int)
+    # surrogate_loss_type: mse # 训练替代模型的损失函数通常由 attacker.py 内部根据 attack_type 自动设置 (e.g., MSE for logits/latents)
+                           # 这里可以不设置
+
+  # Query Strategy (Optional, currently only Random is implemented in attacker.py)
+  # query_strategy:
+  #   name: random        # 'random', or potentially 'active_learning', 'semantic_boundary', etc.
+  #   proxy_dataset_name: cifar10 # 用于生成随机查询的数据集 (可以与受害者不同)
+  #   proxy_data_dir: ./data_cifar10

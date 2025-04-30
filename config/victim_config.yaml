@@ -1,0 +1,52 @@
+# config/victim_config.yaml
+# Configuration for training the Semantic Communication (Victim) Model
+
+# General Setup
+seed: 42                # 随机种子，用于可复现性 (int)
+task: reconstruction    # 训练任务 ('reconstruction' 或 'classification')
+
+# Dataset Configuration
+dataset:
+  name: cifar10         # 数据集名称 ('cifar10' 或 'cifar100', 或未来扩展的其他数据集)
+  data_dir: ./data_cifar10 # 数据集下载/存储路径 (string)
+  augment_train: true   # 是否对训练集进行数据增强 (bool, true/false)
+
+# Victim Model Architecture Configuration
+victim_model:
+  encoder:
+    arch_name: resnet18 # 编码器骨干网络架构 ('resnet18', 'resnet34', 'resnet50', ...)
+    latent_dim: 64      # 潜在空间维度 z (int)
+    pretrained: false    # 是否加载 ImageNet 预训练权重 (bool, true/false)
+                        # 注意: 预训练权重可能对小数据集(如CIFAR)或特定任务不一定最优
+  decoder:
+    # 解码器的 arch_name 通常应与编码器匹配，以便参考其结构，但也可以不同
+    arch_name: resnet18
+    latent_dim: 64      # 必须与编码器的 latent_dim 匹配 (int)
+    output_channels: 3  # 仅用于 reconstruction 任务: 输出图像通道数 (int, e.g., 3 for RGB)
+    # num_classes: 10   # 仅用于 classification 任务: 类别数量 (int, e.g., 10 for CIFAR-10, 100 for CIFAR-100)
+                        # 这个参数通常在主训练脚本中根据数据集自动设置，这里可以省略或注释掉
+    dropout: 0.5        # 仅用于 classification 任务: MLP 解码器头中的 Dropout 比率 (float, 0.0 to 1.0)
+
+# Channel Configuration
+channel:
+  type: awgn            # 信道类型 ('ideal', 'awgn', 'rayleigh')
+  snr_db: 10            # 信噪比 (dB) (float or null)
+                        # 对于 'ideal' 类型, 此值被忽略
+                        # 对于 'awgn', 此值用于计算噪声方差
+                        # 对于 'rayleigh', 此值代表 *平均* SNR
+  # rayleigh_add_awgn: true # 仅用于 'rayleigh' 类型: 是否在衰落后添加 AWGN (bool, true/false, default: true)
+
+# Victim Model Training Configuration
+training_victim:
+  lr: 0.001             # 学习率 (float)
+  batch_size: 256       # 训练批次大小 (int)
+  epochs: 50            # 训练轮数 (int)
+  weight_decay: 0       # 优化器的权重衰减 (L2 正则化) (float, default: 0)
+  loss_type: mse        # 用于训练的损失函数类型
+                        # 'reconstruction' 可选: 'mse', 'l1', 'perceptual' (需要lpips库)
+                        # 'classification' 可选: 'ce' (CrossEntropy, 通常是默认)
+  lr_scheduler: null    # 学习率调度器类型 (null, 'step', 'cosine')
+  # lr_step_size: 15    # 仅用于 'step' scheduler: 多少个 epoch 后降低学习率 (int)
+  # lr_gamma: 0.1       # 仅用于 'step' scheduler: 学习率衰减因子 (float)
+  save_path: ./results/victim_checkpoint # **注意:** train_sc_model.py 会覆盖这个路径，基于其 --output-dir 参数
+                                        # 这里可以作为默认值或文档说明
