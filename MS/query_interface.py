@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from semantic_communication.model import SC_Model # Import the victim model type
+from SC.model import SC_Model # Import the victim model type
 from typing import Union, Tuple
 
 class VictimQueryInterface:

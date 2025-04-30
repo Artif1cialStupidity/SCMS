@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm # For progress bars
+from MS.query_interface import VictimQueryInterface
 
 def train_surrogate_epoch(surrogate_model: nn.Module,
                           loader: DataLoader,
@@ -59,7 +60,7 @@ def train_surrogate_epoch(surrogate_model: nn.Module,
         #      loss = criterion(surrogate_log_probs, victim_probs)
         # else:
              # Default case (e.g., MSE loss for latent vectors or logits)
-             loss = criterion(surrogate_output, target_data)
+        loss = criterion(surrogate_output, target_data)
 
 
         loss.backward()
