@@ -1,0 +1,5 @@
+# Ignore the entire 'data_cifar10' folder
+data_cifar10/
+
+# Ignore specific large files
+data_cifar10/cifar-10-python.tar.gz
