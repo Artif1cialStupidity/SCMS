@@ -1,0 +1,38 @@
+# config/victim_config.yaml
+
+seed: 42
+task: reconstruction # or classification
+
+dataset:
+  name: cifar10
+  data_dir: ./data_cifar10
+  augment_train: true
+
+victim_model:
+  type: base_model  # <<<--- 添加这一行，指定使用 Base_Model
+  encoder:
+    # BaseTransmitter 的参数 (input_channels 会自动设为 3)
+    latent_dim: 128
+    # input_channels: 3 # 可以省略，默认为3
+  decoder:
+    # BaseReceiverDecoder/Classifier 的参数
+    # latent_dim 会自动匹配 encoder
+    # 如果是 reconstruction:
+    output_channels: 3
+    # 如果是 classification:
+    # num_classes: 10 # 也可以省略，脚本会根据数据集自动设置
+  # 注意：对于 Base_Model, encoder/decoder 下的 arch_name 可能不再需要
+  # 但为了兼容性或未来扩展，可以保留
+
+channel:
+  type: awgn
+  snr_db: 10
+
+training_victim:
+  lr: 0.001
+  batch_size: 256
+  epochs: 100
+  weight_decay: 0
+  loss_type: mse # 对于 reconstruction 任务，且 Base_Model 输出 Tanh([-1,1])
+  lr_scheduler: null
+  # save_path: ./results/victim_checkpoint # 会被 train_sc.py 覆盖

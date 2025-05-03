@@ -9,7 +9,8 @@ import os
 from tqdm import tqdm # For progress bars
 
 # Assuming these modules exist in the project structure
-from SC.model import SC_Model
+from SC.res_model import SC_Model
+from SC.base_model import Base_Model
 from data.cifar import get_cifar_loaders
 from evaluation.metrics import calculate_psnr, calculate_accuracy, calculate_ssim # Add SSIM later if needed
 # Consider adding LPIPS if using perceptual loss: from evaluation.metrics import calculate_lpips
@@ -41,7 +42,7 @@ def get_victim_loss_criterion(task: str, loss_type: str = 'default'):
         raise ValueError(f"Unsupported task for loss criterion: {task}")
 
 # --- Training Loop ---
-def train_victim_epoch(model: SC_Model,
+def train_victim_epoch(model: Base_Model,
                        loader: DataLoader,
                        optimizer: optim.Optimizer,
                        criterion: nn.Module,
@@ -89,7 +90,7 @@ def train_victim_epoch(model: SC_Model,
 
 
 # --- Evaluation Loop ---
-def evaluate_victim(model: SC_Model,
+def evaluate_victim(model: Base_Model,
                     loader: DataLoader,
                     criterion: nn.Module, # Can use the same criterion or a different one for eval
                     device: torch.device,
@@ -185,13 +186,48 @@ def train_victim_model(config: dict):
     decoder_conf = config['victim_model']['decoder'].copy() # Avoid modifying original config
     if config['task'] == 'classification':
         decoder_conf['num_classes'] = num_classes
+        # 确保 num_classes 存在
+        if 'num_classes' not in decoder_conf:
+            decoder_conf['num_classes'] = num_classes
+            print(f"Automatically set num_classes to {num_classes} in decoder config")
 
-    model = SC_Model(
-        encoder_config=config['victim_model']['encoder'],
-        channel_config=config['channel'],
-        decoder_config=decoder_conf,
-        task=config['task']
-    ).to(device)
+    
+    model_type = config['victim_model'].get('type', 'resnet_sc').lower() # 使用 get 获取并转小写
+
+    print(f"Attempting to initialize victim model of type: '{model_type}'")
+
+    if model_type == 'base_model':
+        print("Initializing Base_Model...")
+        try:
+            model = Base_Model(
+                encoder_config=config['victim_model']['encoder'],
+                channel_config=config['channel'],
+                decoder_config=decoder_conf,
+                task=config['task']
+            ).to(device)
+            print("Base_Model initialized successfully.")
+        except Exception as e:
+            print(f"Error initializing Base_Model: {e}")
+            # 可以选择退出或抛出异常
+            raise e # 或者 return None / sys.exit(1)
+
+    elif model_type == 'resnet_sc':
+        print("Initializing SC_Model (ResNet based)...")
+        try:
+            model = SC_Model(
+                encoder_config=config['victim_model']['encoder'],
+                channel_config=config['channel'],
+                decoder_config=decoder_conf,
+                task=config['task']
+            ).to(device)
+            print("SC_Model (ResNet) initialized successfully.")
+        except Exception as e:
+            print(f"Error initializing SC_Model (ResNet): {e}")
+            raise e
+
+    else:
+        raise ValueError(f"Unknown victim model type specified in config: '{model_type}'. Choose 'base_model' or 'resnet_sc'.")
+
 
     # Loss and Optimizer
     criterion = get_victim_loss_criterion(
@@ -218,8 +254,8 @@ def train_victim_model(config: dict):
 
 
     # Training Loop
-    best_metric = -float('inf') if config['task'] == 'classification' else float('inf') # Initialize best metric
-    save_path = config.get('save_path', './results/victim')
+    best_metric = -float('inf') 
+    save_path = config.get('save_path', './results/victim_models')
     os.makedirs(save_path, exist_ok=True)
     best_model_path = os.path.join(save_path, f'victim_model_{config["dataset"]["name"]}_{config["task"]}_best.pth')
 
@@ -267,50 +303,3 @@ def train_victim_model(config: dict):
 
     # Return the path to the best model for potential use by the attacker setup
     return best_model_path
-
-
-# Example configuration (can be loaded from YAML or defined here)
-if __name__ == '__main__':
-    dummy_config_recon = {
-        'dataset': {'name': 'cifar10', 'data_dir': './data_cifar10'},
-        'task': 'reconstruction',
-        'victim_model': {
-            'encoder': {'arch_name': 'resnet18', 'latent_dim': 32, 'pretrained': False},
-            'decoder': {'arch_name': 'resnet18', 'latent_dim': 32}
-        },
-        'channel': {'type': 'awgn', 'snr_db': 15},
-        'training_victim': {
-            'batch_size': 128,
-            'lr': 1e-3,
-            'epochs': 5, # Keep epochs low for quick test
-            'loss_type': 'mse'
-        },
-        'seed': 42,
-        'save_path': './results/test_victim_recon'
-    }
-
-    dummy_config_classify = {
-         'dataset': {'name': 'cifar10', 'data_dir': './data_cifar10'},
-         'task': 'classification',
-         'victim_model': {
-             'encoder': {'arch_name': 'resnet18', 'latent_dim': 64, 'pretrained': False},
-             'decoder': {'arch_name': 'resnet18', 'latent_dim': 64, 'dropout': 0.5} # num_classes added in train func
-         },
-         'channel': {'type': 'ideal'}, # Ideal channel for simple classification test
-         'training_victim': {
-             'batch_size': 128,
-             'lr': 1e-3,
-             'epochs': 5,
-             'lr_scheduler': 'step', # Example scheduler
-             'lr_step_size': 3,
-             'lr_gamma': 0.1
-         },
-         'seed': 42,
-         'save_path': './results/test_victim_classify'
-     }
-
-    print("===== Testing Reconstruction Training =====")
-    train_victim_model(dummy_config_recon)
-
-    print("\n===== Testing Classification Training =====")
-    train_victim_model(dummy_config_classify)

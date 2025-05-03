@@ -28,17 +28,8 @@ def calculate_accuracy(output_logits: torch.Tensor, target: torch.Tensor) -> tup
     return accuracy, correct
 
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0) -> float:
+    print("psnr",torch.Tensor)
     """
-    Calculates Peak Signal-to-Noise Ratio between two batches of images.
-    Assumes images are in the range [0, 1] or [-1, 1] after potential denormalization.
-    The 'data_range' should match the maximum possible pixel value minus minimum.
-    If images are normalized to [-1, 1] (like with Tanh output), data_range=2.0.
-    If images are normalized to [0, 1] (like with Sigmoid output), data_range=1.0.
-    Our CIFAR normalization puts data roughly in [-1.x, 1.x], but Tanh outputs [-1, 1].
-    Let's assume the model outputs in [-1, 1] for consistency with Tanh. data_range=2.0
-    If using MSE loss directly on normalized data, PSNR might be less intuitive.
-    Often PSNR is calculated on images scaled back to [0, 255] or [0, 1].
-
     Args:
         img1 (torch.Tensor): First batch of images (B, C, H, W). Values in [-1, 1].
         img2 (torch.Tensor): Second batch of images (B, C, H, W). Values in [-1, 1].
@@ -60,20 +51,13 @@ def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1
 
         # Calculate PSNR
         psnr = 10.0 * math.log10((data_range ** 2) / mse.item())
-        # Alternative using torch.log10
-        # psnr_torch = 10.0 * torch.log10((data_range ** 2) / mse)
-        # return psnr_torch.item()
-
     return psnr
 
 # --- Optional Metrics (Require additional libraries) ---
 
 def calculate_ssim(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0) -> float:
+    print("ssim",torch.Tensor)
     """
-    Calculates Structural Similarity Index (SSIM) between two batches of images.
-    Requires scikit-image. Input images typically expected in [0, 1] or [0, 255].
-    Need to handle data range and channel dimension correctly.
-
     Args:
         img1 (torch.Tensor): First batch (B, C, H, W). Assumed range [0, 1] for calculation.
         img2 (torch.Tensor): Second batch (B, C, H, W). Assumed range [0, 1] for calculation.
@@ -82,11 +66,6 @@ def calculate_ssim(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1
     Returns:
         float: Average SSIM value across the batch.
     """
-    # TODO: Implement SSIM - Needs careful handling of:
-    # 1. Data range conversion (e.g., from [-1, 1] to [0, 1] if needed)
-    # 2. Permuting dimensions (skimage expects channel last or multichannel=True)
-    # 3. Looping through batch or vectorizing the calculation
-    # Example stub:
     with torch.no_grad():
         img1_np = img1.permute(0, 2, 3, 1).cpu().numpy() # B, H, W, C
         img2_np = img2.permute(0, 2, 3, 1).cpu().numpy()
