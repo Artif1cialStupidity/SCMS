@@ -28,7 +28,7 @@ def calculate_accuracy(output_logits: torch.Tensor, target: torch.Tensor) -> tup
     return accuracy, correct
 
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0) -> float:
-    print("psnr",torch.Tensor)
+    #print("psnr",torch.Tensor)
     """
     Args:
         img1 (torch.Tensor): First batch of images (B, C, H, W). Values in [-1, 1].
@@ -56,7 +56,7 @@ def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1
 # --- Optional Metrics (Require additional libraries) ---
 
 def calculate_ssim(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0) -> float:
-    print("ssim",torch.Tensor)
+    #print("ssim",torch.Tensor)
     """
     Args:
         img1 (torch.Tensor): First batch (B, C, H, W). Assumed range [0, 1] for calculation.

@@ -20,4 +20,4 @@ training_victim:
   weight_decay: 0
   loss_type: mse
   lr_scheduler: null
-save_path: ./results/base_sc_50_epoch_100db/checkpoints
+save_path: ./results/base_sc_50_epoch_100db_v2/checkpoints
