@@ -1,0 +1,23 @@
+seed: 42
+task: reconstruction
+dataset:
+  name: cifar10
+  data_dir: ./data_cifar10
+  augment_train: true
+victim_model:
+  type: base_model
+  encoder:
+    latent_dim: 128
+  decoder:
+    output_channels: 3
+channel:
+  type: awgn
+  snr_db: 10
+training_victim:
+  lr: 0.001
+  batch_size: 256
+  epochs: 100
+  weight_decay: 0
+  loss_type: mse
+  lr_scheduler: null
+save_path: ./results/base_sc_100_epoch/checkpoints

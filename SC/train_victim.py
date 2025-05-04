@@ -1,4 +1,4 @@
-# training/train_victim.py
+# SC/train_victim.py
 
 import torch
 import torch.nn as nn
@@ -6,54 +6,50 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import time
 import os
-from tqdm import tqdm # For progress bars
+from tqdm import tqdm # 用于进度条
 
-# Assuming these modules exist in the project structure
-from SC.res_model import SC_Model
-from SC.base_model import Base_Model
+# --- 更新导入 ---
+# 从新的 models 目录导入统一的 SC_Model
+from models.model import SC_Model
+# 数据加载和评估指标的导入保持不变
 from data.cifar import get_cifar_loaders
-from evaluation.metrics import calculate_psnr, calculate_accuracy, calculate_ssim # Add SSIM later if needed
-# Consider adding LPIPS if using perceptual loss: from evaluation.metrics import calculate_lpips
+from evaluation.metrics import calculate_psnr, calculate_accuracy, calculate_ssim # SSIM 可能仍需要安装 scikit-image
 
-# --- Helper Function for Loss ---
+# --- 辅助函数获取损失函数 ---
 def get_victim_loss_criterion(task: str, loss_type: str = 'default'):
-    """Gets the appropriate loss function for the victim model."""
+    """获取受害者模型的损失函数。"""
     if task == 'reconstruction':
-        if loss_type == 'mse' or loss_type == 'default':
-            print("Using MSE Loss for Reconstruction.")
+        if loss_type.lower() == 'mse' or loss_type.lower() == 'default':
+            print("使用 MSE Loss 进行重建。")
             return nn.MSELoss()
-        elif loss_type == 'l1':
-            print("Using L1 Loss for Reconstruction.")
+        elif loss_type.lower() == 'l1':
+            print("使用 L1 Loss 进行重建。")
             return nn.L1Loss()
-        # elif loss_type == 'perceptual':
-        #     print("Using Perceptual Loss (LPIPS - requires installation).")
-        #     # Make sure to install lpips: pip install lpips
-        #     import lpips
-        #     # Use lpips.LPIPS(net='alex') or lpips.LPIPS(net='vgg')
-        #     # Note: LPIPS might require specific input ranges (e.g., [-1, 1])
-        #     return lpips.LPIPS(net='vgg', spatial=True).cuda() # Example, needs device handling
+        # 可以根据需要添加其他损失，例如 perceptual loss (LPIPS)
+        # elif loss_type.lower() == 'perceptual':
+        #     # import lpips
+        #     # return lpips.LPIPS(...)
         else:
-            raise ValueError(f"Unsupported reconstruction loss type: {loss_type}")
+            raise ValueError(f"不支持的重建损失类型: {loss_type}")
     elif task == 'classification':
-        # Default for classification is CrossEntropy
-        print("Using CrossEntropy Loss for Classification.")
+        print("使用 CrossEntropy Loss 进行分类。")
         return nn.CrossEntropyLoss()
     else:
-        raise ValueError(f"Unsupported task for loss criterion: {task}")
+        raise ValueError(f"不支持的任务以获取损失标准: {task}")
 
-# --- Training Loop ---
-def train_victim_epoch(model: Base_Model,
+# --- 训练循环 ---
+def train_victim_epoch(model: SC_Model, # 类型提示更新为统一模型
                        loader: DataLoader,
                        optimizer: optim.Optimizer,
                        criterion: nn.Module,
                        device: torch.device,
                        task: str):
-    """Runs one training epoch for the victim SC model."""
-    model.train() # Set model to training mode
+    """为受害者 SC 模型运行一个训练周期。"""
+    model.train() # 设置模型为训练模式
     total_loss = 0.0
     num_samples = 0
 
-    progress_bar = tqdm(loader, desc=f'Training Epoch', leave=False)
+    progress_bar = tqdm(loader, desc=f'训练 Epoch', leave=False)
     for batch_idx, (data, target) in enumerate(progress_bar):
         data, target = data.to(device), target.to(device)
         batch_size = data.size(0)
@@ -61,207 +57,174 @@ def train_victim_epoch(model: Base_Model,
 
         optimizer.zero_grad()
 
-        # Forward pass
-        # We don't necessarily need intermediate z, z' for the basic loss
-        output = model(data)
+        # 前向传播 (统一模型接口)
+        output = model(data) # 不需要返回潜变量进行基础训练
 
-        # Calculate loss based on task
+        # 根据任务计算损失
         if task == 'reconstruction':
-            loss = criterion(output, data) # Compare reconstructed image with original
-            # Handle LPIPS case separately if needed (input format/range)
-            # if isinstance(criterion, lpips.LPIPS):
-            #    loss = criterion(output, data).mean() # LPIPS might return per-image loss
+            loss = criterion(output, data) # 重建任务比较输出和原始输入
         elif task == 'classification':
-            loss = criterion(output, target) # Compare logits with target class indices
+            loss = criterion(output, target) # 分类任务比较 logits 和目标类别
         else:
-             raise ValueError(f"Unknown task '{task}' during loss calculation")
-
+             raise ValueError(f"在损失计算过程中遇到未知任务 '{task}'")
 
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * batch_size # Accumulate weighted loss
+        total_loss += loss.item() * batch_size # 累加加权损失
 
-        # Update progress bar
+        # 更新进度条
         progress_bar.set_postfix(loss=f'{loss.item():.4f}')
 
-    avg_loss = total_loss / num_samples
+    avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
     return avg_loss
 
-
-# --- Evaluation Loop ---
-def evaluate_victim(model: Base_Model,
+# --- 评估循环 ---
+def evaluate_victim(model: SC_Model, # 类型提示更新为统一模型
                     loader: DataLoader,
-                    criterion: nn.Module, # Can use the same criterion or a different one for eval
+                    criterion: nn.Module,
                     device: torch.device,
                     task: str) -> dict:
-    """Evaluates the victim SC model on a dataset."""
-    model.eval() # Set model to evaluation mode
+    """在数据集上评估受害者 SC 模型。"""
+    model.eval() # 设置模型为评估模式
     total_loss = 0.0
     num_samples = 0
     correct_predictions = 0
     total_psnr = 0.0
-    # total_ssim = 0.0 # Add later
-    # total_lpips = 0.0 # Add later
+    # total_ssim = 0.0 # 如果需要计算 SSIM
 
     results = {}
 
-    progress_bar = tqdm(loader, desc=f'Evaluating', leave=False)
-    with torch.no_grad(): # Disable gradient calculation for evaluation
+    progress_bar = tqdm(loader, desc=f'评估中', leave=False)
+    with torch.no_grad(): # 评估时禁用梯度计算
         for batch_idx, (data, target) in enumerate(progress_bar):
             data, target = data.to(device), target.to(device)
             batch_size = data.size(0)
             num_samples += batch_size
 
-            # Forward pass
+            # 前向传播 (统一模型接口)
             output = model(data)
 
-            # Calculate loss
+            # 计算损失
             if task == 'reconstruction':
                 loss = criterion(output, data)
                 total_loss += loss.item() * batch_size
-                # Calculate image quality metrics
-                psnr_batch = calculate_psnr(output, data)
+                # 计算图像质量指标
+                # 注意：确保 calculate_psnr 接收的数据范围正确（例如，如果Tanh输出[-1,1]，则data_range=2.0）
+                psnr_batch = calculate_psnr(output, data, data_range=2.0) # 假设数据范围是 [-1, 1]
                 total_psnr += psnr_batch * batch_size
-                # ssim_batch = calculate_ssim(output, data) # Add later
+                # ssim_batch = calculate_ssim(output, data) # 如果使用
                 # total_ssim += ssim_batch * batch_size
-                # lpips_batch = calculate_lpips(output, data) # Add later
-                # total_lpips += lpips_batch * batch_size
                 progress_bar.set_postfix(loss=f'{loss.item():.4f}', psnr=f'{psnr_batch:.2f}')
 
             elif task == 'classification':
                 loss = criterion(output, target)
                 total_loss += loss.item() * batch_size
-                # Calculate accuracy
+                # 计算准确率
                 acc_batch, correct_batch = calculate_accuracy(output, target)
                 correct_predictions += correct_batch
                 progress_bar.set_postfix(loss=f'{loss.item():.4f}', acc=f'{acc_batch*100:.2f}%')
 
-    # Calculate average metrics
-    results['loss'] = total_loss / num_samples
+    # 计算平均指标
+    results['loss'] = total_loss / num_samples if num_samples > 0 else 0.0
     if task == 'reconstruction':
-        results['psnr'] = total_psnr / num_samples
-        # results['ssim'] = total_ssim / num_samples # Add later
-        # results['lpips'] = total_lpips / num_samples # Add later
+        results['psnr'] = total_psnr / num_samples if num_samples > 0 else 0.0
+        # results['ssim'] = total_ssim / num_samples # 如果使用
     elif task == 'classification':
-        results['accuracy'] = correct_predictions / num_samples
+        results['accuracy'] = correct_predictions / num_samples if num_samples > 0 else 0.0
 
     return results
 
-
-# --- Main Training Orchestration ---
+# --- 主要训练协调函数 ---
 def train_victim_model(config: dict):
     """
-    Main function to orchestrate the training of the SC victim model.
+    协调 SC 受害者模型训练的主函数。
 
     Args:
-        config (dict): A dictionary containing all necessary configurations.
-                       Expected keys: 'dataset', 'task', 'victim_model', 'channel',
-                                      'training_victim', 'seed', 'save_path'.
+        config (dict): 包含所有必要配置的字典。
+                       预期键: 'dataset', 'task', 'victim_model', 'channel',
+                               'training_victim', 'seed', 'save_path'.
+                       'victim_model' 必须包含 'type'。
     """
-    print("--- Starting Victim Model Training ---")
-    print(f"Config: {config}") # Log config
+    print("--- 开始受害者模型训练 ---")
+    # print(f"配置: {config}") # 打印配置用于调试
 
-    # Setup Device
+    # 设置设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"使用设备: {device}")
 
-    # Reproducibility
-    if 'seed' in config:
-        torch.manual_seed(config['seed'])
-        if device == torch.device("cuda"):
-            torch.cuda.manual_seed_all(config['seed'])
+    # 可复现性
+    seed = config.get('seed', 42) # 从配置获取种子
+    torch.manual_seed(seed)
+    if device == torch.device("cuda"):
+        torch.cuda.manual_seed_all(seed)
+        # torch.backends.cudnn.deterministic = True # 可能影响性能
+        # torch.backends.cudnn.benchmark = False
 
-    # Load Data
+    # 加载数据
     train_loader, test_loader = get_cifar_loaders(
         dataset_name=config['dataset']['name'],
         batch_size=config['training_victim']['batch_size'],
-        data_dir=config['dataset'].get('data_dir', f'./data_{config["dataset"]["name"]}'),
+        data_dir=config['dataset'].get('data_dir', f'./data_{config["dataset"]["name"]}'), # 使用配置中的路径
         augment_train=config['dataset'].get('augment_train', True)
     )
-    num_classes = 10 if config['dataset']['name'] == 'cifar10' else 100
+    # 注意：类别数现在由 SC_Model 的 __init__ 内部根据数据集名称处理
 
-    # Initialize Model
-    # Add num_classes to decoder config if task is classification
-    decoder_conf = config['victim_model']['decoder'].copy() # Avoid modifying original config
-    if config['task'] == 'classification':
-        decoder_conf['num_classes'] = num_classes
-        # 确保 num_classes 存在
-        if 'num_classes' not in decoder_conf:
-            decoder_conf['num_classes'] = num_classes
-            print(f"Automatically set num_classes to {num_classes} in decoder config")
+    # --- 初始化模型 (使用统一的 SC_Model 和完整配置) ---
+    print("初始化统一 SC 模型...")
+    try:
+        # 将整个配置字典传递给模型构造函数
+        model = SC_Model(config=config).to(device)
+        print("SC 模型初始化成功。")
+    except (KeyError, ValueError) as e:
+        print(f"模型初始化失败: {e}")
+        print("请检查配置文件是否包含所有必需的键，特别是 'victim_model.type'。")
+        return None # 初始化失败则返回
+    except Exception as e:
+        print(f"初始化模型时发生意外错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
-    
-    model_type = config['victim_model'].get('type', 'resnet_sc').lower() # 使用 get 获取并转小写
-
-    print(f"Attempting to initialize victim model of type: '{model_type}'")
-
-    if model_type == 'base_model':
-        print("Initializing Base_Model...")
-        try:
-            model = Base_Model(
-                encoder_config=config['victim_model']['encoder'],
-                channel_config=config['channel'],
-                decoder_config=decoder_conf,
-                task=config['task']
-            ).to(device)
-            print("Base_Model initialized successfully.")
-        except Exception as e:
-            print(f"Error initializing Base_Model: {e}")
-            # 可以选择退出或抛出异常
-            raise e # 或者 return None / sys.exit(1)
-
-    elif model_type == 'resnet_sc':
-        print("Initializing SC_Model (ResNet based)...")
-        try:
-            model = SC_Model(
-                encoder_config=config['victim_model']['encoder'],
-                channel_config=config['channel'],
-                decoder_config=decoder_conf,
-                task=config['task']
-            ).to(device)
-            print("SC_Model (ResNet) initialized successfully.")
-        except Exception as e:
-            print(f"Error initializing SC_Model (ResNet): {e}")
-            raise e
-
-    else:
-        raise ValueError(f"Unknown victim model type specified in config: '{model_type}'. Choose 'base_model' or 'resnet_sc'.")
-
-
-    # Loss and Optimizer
+    # 损失函数和优化器
     criterion = get_victim_loss_criterion(
         config['task'],
-        config['training_victim'].get('loss_type', 'default')
+        config['training_victim'].get('loss_type', 'default') # 从配置获取损失类型
     ).to(device)
 
     optimizer = optim.Adam(
         model.parameters(),
         lr=config['training_victim']['lr'],
-        weight_decay=config['training_victim'].get('weight_decay', 0) # Optional weight decay
+        weight_decay=config['training_victim'].get('weight_decay', 0) # 从配置获取权重衰减
     )
 
-    # Optional: Learning Rate Scheduler
+    # 可选：学习率调度器
     scheduler = None
-    if config['training_victim'].get('lr_scheduler', None) == 'cosine':
+    scheduler_config = config['training_victim'].get('lr_scheduler') # 简化获取
+    if scheduler_config == 'cosine':
          scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['training_victim']['epochs'])
-         print("Using Cosine Annealing LR Scheduler.")
-    elif config['training_victim'].get('lr_scheduler', None) == 'step':
-         scheduler = optim.lr_scheduler.StepLR(optimizer,
-                                               step_size=config['training_victim']['lr_step_size'],
-                                               gamma=config['training_victim']['lr_gamma'])
-         print(f"Using Step LR Scheduler (step={config['training_victim']['lr_step_size']}, gamma={config['training_victim']['lr_gamma']}).")
+         print("使用 Cosine Annealing LR 调度器。")
+    elif scheduler_config == 'step':
+         lr_step_size = config['training_victim'].get('lr_step_size')
+         lr_gamma = config['training_victim'].get('lr_gamma')
+         if lr_step_size is None or lr_gamma is None:
+             print("警告: Step LR 调度器需要 'lr_step_size' 和 'lr_gamma' 配置。")
+         else:
+             scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size, gamma=lr_gamma)
+             print(f"使用 Step LR 调度器 (step={lr_step_size}, gamma={lr_gamma})。")
 
+    # 训练循环
+    best_metric = -float('inf') if config['task'] == 'reconstruction' else 0.0 # PSNR 越高越好, Acc 越高越好
+    save_path_dir = config.get('save_path', './results/victim_models') # 使用配置或默认值
+    os.makedirs(save_path_dir, exist_ok=True)
+    # 文件名可以包含更多信息
+    model_filename = f'victim_{config["dataset"]["name"]}_{config["task"]}_{config["victim_model"]["type"]}_best.pth'
+    best_model_path = os.path.join(save_path_dir, model_filename)
 
-    # Training Loop
-    best_metric = -float('inf') 
-    save_path = config.get('save_path', './results/victim_models')
-    os.makedirs(save_path, exist_ok=True)
-    best_model_path = os.path.join(save_path, f'victim_model_{config["dataset"]["name"]}_{config["task"]}_best.pth')
-
-    print("\nStarting training loop...")
+    print("\n开始训练循环...")
     start_time = time.time()
-    for epoch in range(1, config['training_victim']['epochs'] + 1):
+    epochs = config['training_victim']['epochs']
+    for epoch in range(1, epochs + 1):
         epoch_start_time = time.time()
 
         train_loss = train_victim_epoch(model, train_loader, optimizer, criterion, device, config['task'])
@@ -269,37 +232,46 @@ def train_victim_model(config: dict):
         eval_loss = eval_results['loss']
 
         epoch_duration = time.time() - epoch_start_time
-        print(f"Epoch {epoch}/{config['training_victim']['epochs']} | Time: {epoch_duration:.2f}s | "
-              f"Train Loss: {train_loss:.4f} | Eval Loss: {eval_loss:.4f}", end="")
+        log_prefix = f"Epoch {epoch}/{epochs} | Time: {epoch_duration:.2f}s | Train Loss: {train_loss:.4f} | Eval Loss: {eval_loss:.4f}"
 
-        # Log and Checkpoint Best Model based on task-specific metric
+        # 记录和检查点最佳模型
         current_metric = 0
+        metric_name = ""
+        is_best = False
         if config['task'] == 'reconstruction':
-            current_metric = eval_results.get('psnr', -float('inf')) # Use PSNR, default to -inf if not calculated
-            print(f" | Eval PSNR: {current_metric:.2f} dB")
-            is_best = current_metric > best_metric # Higher PSNR is better
+            metric_name = 'PSNR'
+            current_metric = eval_results.get('psnr', -float('inf'))
+            print(f"{log_prefix} | Eval PSNR: {current_metric:.2f} dB")
+            is_best = current_metric > best_metric # PSNR 越高越好
         elif config['task'] == 'classification':
+            metric_name = 'Accuracy'
             current_metric = eval_results.get('accuracy', 0.0)
-            print(f" | Eval Accuracy: {current_metric*100:.2f}%")
-            is_best = current_metric > best_metric # Higher Accuracy is better
+            print(f"{log_prefix} | Eval Accuracy: {current_metric*100:.2f}%")
+            is_best = current_metric > best_metric # Acc 越高越好
 
         if is_best:
             best_metric = current_metric
-            print(f"  => Saving new best model to {best_model_path}")
-            torch.save(model.state_dict(), best_model_path)
-        else:
-             print("") # Newline if not saving
+            print(f"  => 新的最佳 {metric_name} ({best_metric:.4f}). 保存模型到 {best_model_path}")
+            try:
+                torch.save(model.state_dict(), best_model_path)
+            except Exception as e:
+                print(f"  !! 保存模型时出错: {e}")
+        # else:
+        #      print("") # 如果不保存，则打印空行以保持格式
 
-
-        # LR Scheduler Step
+        # LR 调度器步骤
         if scheduler:
-             scheduler.step()
+             # 检查调度器的类型，有些可能需要在 epoch 结束时 step，有些在 batch 结束时
+             if isinstance(scheduler, (optim.lr_scheduler.CosineAnnealingLR, optim.lr_scheduler.StepLR)):
+                 scheduler.step()
+             # elif isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+             #     scheduler.step(eval_loss) # 例如，基于验证损失调整
 
     total_training_time = time.time() - start_time
-    print(f"\n--- Victim Training Finished ---")
-    print(f"Total Training Time: {total_training_time:.2f}s")
-    print(f"Best Evaluation Metric ({'Accuracy' if config['task'] == 'classification' else 'PSNR'}): {best_metric:.4f}")
-    print(f"Best model saved to: {best_model_path}")
+    print(f"\n--- 受害者训练完成 ---")
+    print(f"总训练时间: {total_training_time:.2f}s ({total_training_time/60:.2f} min)")
+    print(f"最佳评估指标 ({metric_name}): {best_metric:.4f}")
+    print(f"最佳模型已保存到: {best_model_path}")
 
-    # Return the path to the best model for potential use by the attacker setup
+    # 返回最佳模型的路径，供后续步骤（如攻击）使用
     return best_model_path

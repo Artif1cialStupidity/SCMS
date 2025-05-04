@@ -26,12 +26,12 @@ victim_model:
 
 channel:
   type: awgn
-  snr_db: 10
+  snr_db: 100
 
 training_victim:
   lr: 0.001
   batch_size: 256
-  epochs: 100
+  epochs: 50
   weight_decay: 0
   loss_type: mse # 对于 reconstruction 任务，且 Base_Model 输出 Tanh([-1,1])
   lr_scheduler: null
