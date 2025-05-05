@@ -1,0 +1,18 @@
+seed: 43
+attacker:
+  type: steal_encoder
+  query_access: encoder_query
+  latent_access: noisy_scaled_z
+  noise_scale: 0.2
+  query_budget: 10000
+  proxy_dataset:
+    name: cifar100
+    data_dir: ./data_cifar100
+  surrogate_model:
+    arch_name: base_model
+    latent_dim: 128
+  training_attacker:
+    lr: 0.001
+    batch_size: 128
+    epochs: 15
+    query_batch_size: 256

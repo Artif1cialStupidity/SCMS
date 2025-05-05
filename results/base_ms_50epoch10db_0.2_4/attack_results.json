@@ -1,0 +1,17 @@
+{
+    "attack_config_summary": {
+        "type": "steal_encoder",
+        "query_access": "end_to_end_query",
+        "latent_access": "noisy_scaled_z",
+        "noise_scale": 0.2,
+        "query_budget": 10000,
+        "final_query_count": 10000,
+        "proxy_dataset_used": "cifar100",
+        "surrogate_encoder_arch": "resnet18"
+    },
+    "evaluation_metrics": {
+        "latent_mse": 0.07969474792480469,
+        "latent_cosine_similarity": 0.9196093678474426
+    },
+    "surrogate_model_saved_path": "./results/base_ms_50epoch10db_0.2_4/surrogate_encoder.pth"
+}

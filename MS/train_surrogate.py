@@ -1,204 +1,131 @@
-# training/train_attacker.py
+# MS/train_surrogate.py
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm # For progress bars
-from MS.query_interface import VictimQueryInterface
+from tqdm import tqdm
+# Remove VictimQueryInterface import if not needed directly here
+# from MS.query_interface import VictimQueryInterface
+import torch.nn.functional as F # For loss and similarity metrics
 
-def train_surrogate_epoch(surrogate_model: nn.Module,
+# train_surrogate_epoch remains largely the same, ensure it takes 'model' argument
+def train_surrogate_epoch(model: nn.Module, # Changed arg name to generic 'model'
                           loader: DataLoader,
                           optimizer: optim.Optimizer,
                           criterion: nn.Module,
                           device: torch.device,
-                          attack_type: str,
-                          task: str = 'reconstruction'): # Task needed for potential KLDiv loss case
+                          attack_type: str, # Keep for potential logging
+                          task: str = 'latent_matching'): # Default or specific task hint
     """
-    Runs one training epoch for the attacker's surrogate model.
-
+    Runs one training epoch for the attacker's surrogate model (e.g., encoder).
     Args:
-        surrogate_model (nn.Module): The surrogate model being trained.
-        loader (DataLoader): DataLoader providing the (input, target) pairs
-                             collected from the victim.
-        optimizer (optim.Optimizer): Optimizer for the surrogate model.
-        criterion (nn.Module): Loss function to compare surrogate output with victim output.
-                               (e.g., MSE for latent vectors or logits, maybe KLDiv).
-        device (torch.device): Device to run training on.
-        attack_type (str): Type of attack ('steal_encoder', 'steal_decoder', 'steal_end2end').
-                           Potentially useful if loss logic differs slightly.
-        task (str): Victim's task ('reconstruction' or 'classification'). Needed if using
-                    KL divergence loss for classification logits.
-
+        model (nn.Module): The surrogate model being trained (e.g., encoder).
+        # ... other args as before ...
     Returns:
         float: Average loss for the epoch.
     """
-    surrogate_model.train() # Set surrogate model to training mode
+    model.train() # Set surrogate model to training mode
     total_loss = 0.0
     num_samples = 0
 
-    progress_bar = tqdm(loader, desc=f'Training Surrogate', leave=False)
+    progress_bar = tqdm(loader, desc=f'Training Surrogate ({task})', leave=False)
     for batch_idx, (input_data, target_data) in enumerate(progress_bar):
-        input_data = input_data.to(device)
-        target_data = target_data.to(device) # This is the victim's output (z, y, etc.)
+        input_data = input_data.to(device) # This is X
+        target_data = target_data.to(device) # This is the target z_observed
         batch_size = input_data.size(0)
         num_samples += batch_size
 
         optimizer.zero_grad()
 
-        # Forward pass through the surrogate model
-        surrogate_output = surrogate_model(input_data)
+        # Forward pass through the surrogate model (encoder)
+        surrogate_output = model(input_data) # surrogate_output is surrogate_z
 
-        # Calculate loss: surrogate_output vs victim's output (target_data)
-        # Special handling for KL Divergence if used for classification logits:
-        # if isinstance(criterion, nn.KLDivLoss) and task == 'classification' and \
-        #    (attack_type == 'steal_decoder' or attack_type == 'steal_end2end'):
-        #      # Requires victim output (target_data) to be probabilities (apply softmax)
-        #      # and surrogate output to be log-probabilities (apply log_softmax)
-        #      surrogate_log_probs = F.log_softmax(surrogate_output, dim=1)
-        #      victim_probs = F.softmax(target_data, dim=1) # Assuming target_data are logits
-        #      loss = criterion(surrogate_log_probs, victim_probs)
-        # else:
-             # Default case (e.g., MSE loss for latent vectors or logits)
+        # Calculate loss: surrogate_output (surrogate_z) vs victim's observed z (target_data)
         loss = criterion(surrogate_output, target_data)
 
-
         loss.backward()
-        # Optional: Gradient clipping can sometimes help stabilize training
-        # torch.nn.utils.clip_grad_norm_(surrogate_model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_loss += loss.item() * batch_size # Accumulate weighted loss
-
-        # Update progress bar
-        progress_bar.set_postfix(loss=f'{loss.item():.4f}')
+        total_loss += loss.item() * batch_size
+        progress_bar.set_postfix(loss=f'{loss.item():.6f}')
 
     avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
     return avg_loss
 
-# --- Fidelity Evaluation Function ---
-# This function compares the surrogate and victim models directly.
-# It could live here or in attacker/attacker.py or evaluation/metrics.py.
-# Let's put it here for now as it's closely related to the surrogate training goal.
+# --- Updated Fidelity Evaluation Function (Encoder vs Encoder) ---
 
-def evaluate_surrogate_fidelity(victim_interface: VictimQueryInterface,
-                                surrogate_model: nn.Module,
+def evaluate_surrogate_fidelity(victim_encoder: nn.Module,
+                                surrogate_encoder: nn.Module,
                                 test_loader: DataLoader,
-                                device: torch.device,
-                                task: str,
-                                attack_type: str,
-                                latent_access: str) -> dict:
+                                device: torch.device) -> dict:
     """
-    Evaluates how well the surrogate model mimics the victim model on a test set.
+    Evaluates how well the surrogate ENCODER mimics the victim ENCODER on a test set.
+    Compares their latent outputs (z) for the same input X.
 
     Args:
-        victim_interface (VictimQueryInterface): Interface to query the victim.
-        surrogate_model (nn.Module): The trained surrogate model.
-        test_loader (DataLoader): DataLoader for the original test dataset.
+        victim_encoder (nn.Module): The original victim encoder model.
+        surrogate_encoder (nn.Module): The trained surrogate encoder model.
+        test_loader (DataLoader): DataLoader for the original test dataset (provides X).
         device (torch.device): Device to run evaluation on.
-        task (str): The victim's task ('reconstruction' or 'classification').
-        attack_type (str): The type of attack performed.
-        latent_access (str): The latent access level the attacker had.
 
     Returns:
-        dict: Dictionary containing fidelity metrics (e.g., 'model_agreement', 'output_mse').
+        dict: Dictionary containing fidelity metrics (e.g., 'latent_mse', 'latent_cosine_similarity').
     """
-    victim_interface.victim_model.eval() # Ensure victim is in eval mode
-    surrogate_model.eval() # Ensure surrogate is in eval mode
+    victim_encoder.eval()
+    surrogate_encoder.eval()
 
-    all_victim_outputs = []
-    all_surrogate_outputs = []
+    all_victim_z = []
+    all_surrogate_z = []
     total_samples = 0
 
-    progress_bar = tqdm(test_loader, desc="Evaluating Fidelity", leave=False)
+    progress_bar = tqdm(test_loader, desc="Evaluating Encoder Fidelity", leave=False)
     with torch.no_grad():
-        for batch_idx, (data, _) in enumerate(progress_bar): # Ignore original labels here
+        for batch_idx, (data, _) in enumerate(progress_bar): # Input data X, ignore labels
             data = data.to(device)
             batch_size = data.size(0)
             total_samples += batch_size
 
-            # Determine the input for the surrogate and how to get the comparable victim output
-            surrogate_input = None
-            victim_target_output = None # The victim output the surrogate should match
+            # Get latent vectors from both encoders for the same input X
+            victim_z = victim_encoder(data)
+            surrogate_z = surrogate_encoder(data)
 
-            if attack_type == 'steal_encoder':
-                surrogate_input = data
-                # Need victim's clean z
-                victim_output_package = victim_interface.query(data) # Query using current interface settings
-                if latent_access == 'clean_z' or victim_interface.query_access == 'encoder_query':
-                     # If access gives clean_z, use it directly
-                     if isinstance(victim_output_package, tuple): victim_target_output = victim_output_package[1]
-                     else: victim_target_output = victim_output_package # Primary output is z
-                else:
-                     # Cannot directly evaluate fidelity if clean_z wasn't available during attack training phase
-                     print("Warning: Cannot evaluate steal_encoder fidelity without clean_z access during evaluation.")
-                     continue # Skip this batch for fidelity calc
-                surrogate_output = surrogate_model(surrogate_input)
-
-            elif attack_type == 'steal_decoder':
-                 # Surrogate input is z'. Need victim's Y for the same z'.
-                 # Generate z' using victim's encoder + channel
-                 z = victim_interface.victim_model.encode(data)
-                 victim_interface.victim_model.channel.eval()
-                 z_prime = victim_interface.victim_model.channel(z)
-                 surrogate_input = z_prime
-                 # Get victim's output for this z_prime
-                 victim_target_output = victim_interface.victim_model.decode(z_prime)
-                 surrogate_output = surrogate_model(surrogate_input)
-
-            elif attack_type == 'steal_end2end':
-                 surrogate_input = data
-                 # Need victim's Y for this X
-                 victim_output_package = victim_interface.query(data) # Query using interface settings
-                 if isinstance(victim_output_package, tuple): victim_target_output = victim_output_package[0] # Primary output is Y
-                 else: victim_target_output = victim_output_package
-                 surrogate_output = surrogate_model(surrogate_input)
-
-            else:
-                 raise ValueError(f"Unknown attack type for fidelity evaluation: {attack_type}")
-
-
-            if victim_target_output is not None:
-                 all_victim_outputs.append(victim_target_output.cpu())
-                 all_surrogate_outputs.append(surrogate_output.cpu())
-
+            all_victim_z.append(victim_z.cpu())
+            all_surrogate_z.append(surrogate_z.cpu())
 
     results = {}
-    if not all_victim_outputs: # Check if we skipped all batches
-        print("Warning: No data collected for fidelity evaluation.")
+    if not all_victim_z:
+        print("Warning: No data processed for fidelity evaluation.")
         return results
 
-    victim_outputs_all = torch.cat(all_victim_outputs, dim=0)
-    surrogate_outputs_all = torch.cat(all_surrogate_outputs, dim=0)
+    victim_z_all = torch.cat(all_victim_z, dim=0)
+    surrogate_z_all = torch.cat(all_surrogate_z, dim=0)
 
-    # Calculate metrics based on task and attack type
-    if task == 'classification' and (attack_type == 'steal_decoder' or attack_type == 'steal_end2end'):
-        agreement = calculate_model_agreement(victim_outputs_all, surrogate_outputs_all, task='classification')
-        results['model_agreement'] = agreement
-        # Also calculate MSE/L1 on logits as a fidelity measure
-        logit_mse = F.mse_loss(surrogate_outputs_all, victim_outputs_all).item()
-        results['logit_mse'] = logit_mse
-    elif task == 'reconstruction' and (attack_type == 'steal_decoder' or attack_type == 'steal_end2end'):
-        # Compare reconstructed images
-        output_mse = F.mse_loss(surrogate_outputs_all, victim_outputs_all).item()
-        results['output_mse'] = output_mse
-        # Could also calculate PSNR/SSIM/LPIPS between victim/surrogate outputs
-        fidelity_psnr = calculate_psnr(surrogate_outputs_all, victim_outputs_all, data_range=2.0) # Assuming [-1,1] range
-        results['fidelity_psnr'] = fidelity_psnr
-    elif attack_type == 'steal_encoder':
-        # Compare latent vectors
-        latent_mse = F.mse_loss(surrogate_outputs_all, victim_outputs_all).item()
-        results['latent_mse'] = latent_mse
-        # Could calculate cosine similarity too
-        latent_cosine_sim = F.cosine_similarity(surrogate_outputs_all, victim_outputs_all, dim=1).mean().item()
-        results['latent_cosine_similarity'] = latent_cosine_sim
+    # Calculate metrics comparing the latent vectors z
+    # 1. Mean Squared Error (MSE) between latent vectors
+    latent_mse = F.mse_loss(surrogate_z_all, victim_z_all).item()
+    results['latent_mse'] = latent_mse
+
+    # 2. Cosine Similarity between latent vectors
+    # Ensure vectors are not zero vectors before calculating cosine similarity
+    epsilon = 1e-8
+    victim_norm = victim_z_all.norm(p=2, dim=1, keepdim=True)
+    surrogate_norm = surrogate_z_all.norm(p=2, dim=1, keepdim=True)
+
+    # Avoid division by zero for zero vectors, set their similarity to 0 or 1? Let's use 0.
+    valid_mask = (victim_norm > epsilon) & (surrogate_norm > epsilon)
+    valid_mask = valid_mask.squeeze()
+
+    if valid_mask.any():
+         cosine_sim = F.cosine_similarity(surrogate_z_all[valid_mask], victim_z_all[valid_mask], dim=1)
+         latent_cosine_sim_mean = cosine_sim.mean().item()
+    else:
+         latent_cosine_sim_mean = 0.0 # Or nan?
+
+    results['latent_cosine_similarity'] = latent_cosine_sim_mean
+
+    # Can add L1 loss if desired
+    # latent_l1 = F.l1_loss(surrogate_z_all, victim_z_all).item()
+    # results['latent_l1'] = latent_l1
 
     return results
-
-
-# Example usage (placeholder, real usage is within attacker.py)
-if __name__ == '__main__':
-    print("This file contains helper functions for training the surrogate model.")
-    print("Run attacker.py to execute the attack and use these functions.")
-    # You could add specific unit tests for train_surrogate_epoch here if desired,
-    # creating dummy models, loaders, and criteria.

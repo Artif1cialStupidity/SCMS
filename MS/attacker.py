@@ -6,20 +6,22 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 import random
 import os
+import time # <-- Import time for training duration reporting
 from tqdm import tqdm
-import copy # To potentially deep copy model architectures
+import copy
 
-# Assuming these modules exist
 from MS.query_interface import VictimQueryInterface
-from models.resnet_sc import ResNetEncoderSC, ResNetDecoderSC # Can reuse victim architectures
-# Or define specific surrogate models: from attacker.surrogate_model import SurrogateEncoder, SurrogateDecoder
-from MS.train_surrogate import train_surrogate_epoch, evaluate_surrogate_fidelity # Need to define these
-from evaluation.metrics import calculate_model_agreement, calculate_accuracy, calculate_psnr # Import necessary eval metrics
+# Use the component import path directly
+from models.components.resnet_components import ResNetEncoderSC # Or BaseTransmitter if needed
+# Surrogate loss/eval helpers
+from MS.train_surrogate import train_surrogate_epoch, evaluate_surrogate_fidelity
+# Metrics specific for encoder comparison (can be in metrics.py or defined here)
+from evaluation.metrics import calculate_psnr # Keep if needed elsewhere, but focus on latent metrics
+import torch.nn.functional as F # For MSE Loss, Cosine Similarity
 
-# --- Placeholder for Query Strategies ---
-# You might define more sophisticated strategies later
+# --- RandomQueryStrategy remains the same ---
 class RandomQueryStrategy:
-    """Selects random samples from a proxy dataset."""
+    # ... (implementation as before) ...
     def __init__(self, proxy_dataloader: DataLoader):
         self.proxy_dataloader = proxy_dataloader
         self.iterator = iter(self.proxy_dataloader)
@@ -37,38 +39,33 @@ class RandomQueryStrategy:
         if data.size(0) > batch_size:
             data = data[:batch_size]
         elif data.size(0) < batch_size:
-             print(f"Warning: Proxy loader returned batch smaller than requested ({data.size(0)} < {batch_size}).")
-             # Handle potentially smaller last batch, or refill? For simplicity, use what we got.
+             # print(f"Warning: Proxy loader returned batch smaller than requested ({data.size(0)} < {batch_size}). Using smaller batch.")
              pass # Use the smaller batch
-
 
         return data.to(device)
 
 class ModelStealingAttacker:
     """
-    Orchestrates the model stealing attack against an SC system.
+    Orchestrates the model stealing attack against an SC system's ENCODER.
     """
     def __init__(self,
                  attack_config: dict,
                  victim_interface: VictimQueryInterface,
-                 surrogate_model_config: dict,
+                 surrogate_model_config: dict, # Config for the SURROGATE ENCODER
                  attacker_train_config: dict,
-                 proxy_dataloader: DataLoader, # Used for generating initial queries
+                 proxy_dataloader: DataLoader,
                  device: torch.device):
         """
-        Initializes the attacker.
+        Initializes the attacker for stealing the encoder.
 
         Args:
-            attack_config (dict): Configuration for the attack type, access, budget.
+            attack_config (dict): Config for attack (type, access, budget, noise_scale).
             victim_interface (VictimQueryInterface): Interface to query the victim.
-            surrogate_model_config (dict): Configuration for the surrogate model architecture.
-                                          Needs 'arch_name', 'latent_dim'.
-                                          For classification decoder, needs 'num_classes'.
-            attacker_train_config (dict): Configuration for training the surrogate.
-                                           Needs 'lr', 'batch_size', 'epochs' or connects to budget.
-            proxy_dataloader (DataLoader): DataLoader for a public or auxiliary dataset
-                                           to generate queries from (attacker doesn't have victim's train data).
-            device (torch.device): The device to run computations on.
+            surrogate_model_config (dict): Config for the surrogate ENCODER architecture
+                                          (e.g., 'arch_name', 'latent_dim').
+            attacker_train_config (dict): Config for training the surrogate (lr, batch_size, epochs).
+            proxy_dataloader (DataLoader): DataLoader for generating queries.
+            device (torch.device): Device for computations.
         """
         self.attack_config = attack_config
         self.victim_interface = victim_interface
@@ -77,131 +74,76 @@ class ModelStealingAttacker:
         self.proxy_dataloader = proxy_dataloader
         self.device = device
 
-        self.attack_type = self.attack_config.get('type', 'steal_end2end') # steal_encoder, steal_decoder, steal_end2end
-        self.query_access = self.attack_config.get('query_access', 'end_to_end_query')
-        self.latent_access = self.attack_config.get('latent_access', 'none')
-        self.query_budget = self.attack_config.get('query_budget', 10000) # Default budget
-        self.collected_data = [] # List to store (query_input, victim_output, [optional_latent]) tuples
+        # --- Enforce Encoder Stealing Focus ---
+        self.attack_type = self.attack_config.get('type')
+        if self.attack_type != 'steal_encoder':
+            raise ValueError(f"This attacker implementation currently only supports 'steal_encoder'. Found type: {self.attack_type}")
 
-        # --- Initialize Surrogate Model ---
-        self._initialize_surrogate_model()
+        self.query_access = self.attack_config.get('query_access')
+        self.latent_access = self.attack_config.get('latent_access')
+        # Ensure latent access is suitable for getting noisy z
+        if self.latent_access not in ['noisy_scaled_z', 'clean_z']: # clean_z could be a baseline
+             print(f"Warning: Latent access is {self.latent_access}. Ensure this provides the desired (X, z_observed) pairs for training the encoder.")
+             if self.latent_access != 'noisy_scaled_z':
+                  print("Ensure the 'noise_scale' parameter is handled appropriately or ignored if not needed.")
+
+
+        self.query_budget = self.attack_config.get('query_budget', 10000)
+        self.collected_data = [] # List to store (query_input_X, observed_latent_z) tuples
+
+        # --- Initialize Surrogate ENCODER Model ---
+        self._initialize_surrogate_encoder() # Renamed method
 
         # --- Initialize Query Strategy ---
-        # For now, use a simple random strategy from the proxy loader
         self.query_strategy = RandomQueryStrategy(self.proxy_dataloader)
 
-        # --- Setup Training Components for Surrogate ---
+        # --- Setup Training Components for Surrogate ENCODER ---
         self.surrogate_optimizer = optim.Adam(
-            self.surrogate_model.parameters(),
+            self.surrogate_encoder.parameters(), # Use surrogate_encoder
             lr=self.attacker_train_config.get('lr', 1e-3)
         )
-        # Surrogate loss depends on what we are stealing
-        self._setup_surrogate_loss()
+        # Surrogate loss: Match the observed latent representation z
+        self.surrogate_criterion = nn.MSELoss() # Or CosineEmbeddingLoss, L1Loss
+        print("Using MSE loss for stealing encoder (matching observed latent z).")
 
-        print(f"Initialized ModelStealingAttacker:")
-        print(f"  Attack Type: {self.attack_type}")
+
+        print(f"Initialized ModelStealingAttacker (Encoder Focus):")
+        print(f"  Query Access: {self.query_access}")
+        print(f"  Latent Access: {self.latent_access}")
+        if self.latent_access == 'noisy_scaled_z':
+            print(f"  Noise Scale: {self.attack_config.get('noise_scale')}")
         print(f"  Query Budget: {self.query_budget}")
-        print(f"  Surrogate Model: {self.surrogate_model.__class__.__name__}")
+        print(f"  Surrogate Encoder: {self.surrogate_encoder.__class__.__name__} ({self.surrogate_model_config['arch_name']})")
 
 
-    def _initialize_surrogate_model(self):
-        """Initializes the surrogate model based on the attack type."""
+    def _initialize_surrogate_encoder(self):
+        """Initializes the surrogate ENCODER model."""
         arch = self.surrogate_model_config['arch_name']
         latent_dim = self.surrogate_model_config['latent_dim']
 
-        if self.attack_type == 'steal_encoder':
-            # Attacker wants to replicate the encoder
-            self.surrogate_model = ResNetEncoderSC(
+        # Attacker wants to replicate the encoder X -> z
+        # Use a suitable encoder architecture, e.g., ResNetEncoderSC
+        # Or potentially BaseTransmitter if specified
+        if 'resnet' in arch.lower():
+            self.surrogate_encoder = ResNetEncoderSC(
                 arch_name=arch,
                 latent_dim=latent_dim,
                 pretrained=False # Attacker trains from scratch
             ).to(self.device)
-        elif self.attack_type == 'steal_decoder':
-             # Attacker wants to replicate the decoder
-             task = self.surrogate_model_config.get('task', 'reconstruction') # Need task info for decoder
-             if task == 'reconstruction':
-                 self.surrogate_model = ResNetDecoderSC(
-                     arch_name=arch, # Should match victim's encoder arch
-                     latent_dim=latent_dim,
-                     output_channels=self.surrogate_model_config.get('output_channels', 3)
-                 ).to(self.device)
-             elif task == 'classification':
-                  num_classes = self.surrogate_model_config.get('num_classes')
-                  if num_classes is None: raise ValueError("Need num_classes for surrogate classification decoder")
-                  # Simple MLP surrogate decoder/classifier head
-                  self.surrogate_model = nn.Sequential(
-                       nn.Linear(latent_dim, 512),
-                       nn.ReLU(inplace=True),
-                       nn.Dropout(p=self.surrogate_model_config.get('dropout', 0.5)),
-                       nn.Linear(512, num_classes)
-                  ).to(self.device)
-             else:
-                  raise ValueError(f"Unknown task for surrogate decoder: {task}")
-
-        elif self.attack_type == 'steal_end2end':
-             # Attacker builds a *direct* model from X to Y (doesn't necessarily have SC structure)
-             # For simplicity, let's assume attacker uses a standard ResNet for classification
-             # or an Autoencoder-like structure for reconstruction.
-             # Or, attacker could try to replicate the *victim's* SC structure. Let's do that for consistency.
-             print("Initializing end-to-end surrogate with SC structure (Encoder -> Decoder)")
-             # NOTE: No channel simulated in the surrogate typically, unless attacker aims to steal robustness too.
-             surrogate_encoder = ResNetEncoderSC(arch_name=arch, latent_dim=latent_dim, pretrained=False)
-             task = self.surrogate_model_config.get('task', 'reconstruction')
-             if task == 'reconstruction':
-                  surrogate_decoder = ResNetDecoderSC(arch_name=arch, latent_dim=latent_dim, output_channels=self.surrogate_model_config.get('output_channels', 3))
-             elif task == 'classification':
-                  num_classes = self.surrogate_model_config.get('num_classes')
-                  if num_classes is None: raise ValueError("Need num_classes for surrogate classification decoder")
-                  surrogate_decoder = nn.Sequential(nn.Linear(latent_dim, num_classes)) # Simplest head
-             else:
-                  raise ValueError(f"Unknown task for surrogate end-to-end: {task}")
-
-             # Combine them - This surrogate *doesn't* simulate the channel internally
-             class SurrogateEnd2End(nn.Module):
-                 def __init__(self, enc, dec):
-                     super().__init__()
-                     self.encoder = enc
-                     self.decoder = dec
-                 def forward(self, x):
-                     z = self.encoder(x)
-                     y = self.decoder(z)
-                     return y
-             self.surrogate_model = SurrogateEnd2End(surrogate_encoder, surrogate_decoder).to(self.device)
-
+        # Add BaseTransmitter option if needed
+        # elif arch == 'base_transmitter':
+        #     self.surrogate_encoder = BaseTransmitter(...)
         else:
-            raise ValueError(f"Unknown attack type: {self.attack_type}")
+            # Fallback or error for unknown arch
+             print(f"Warning: Unknown surrogate architecture '{arch}'. Using ResNetEncoderSC as default.")
+             self.surrogate_encoder = ResNetEncoderSC(
+                 arch_name='resnet18', # Default arch
+                 latent_dim=latent_dim,
+                 pretrained=False
+            ).to(self.device)
 
-    def _setup_surrogate_loss(self):
-        """Sets up the loss function for training the surrogate."""
-        if self.attack_type == 'steal_encoder':
-            # Match the latent representation z
-            self.surrogate_criterion = nn.MSELoss() # Or L1Loss, Cosine Similarity Loss
-            print("Using MSE loss for stealing encoder (matching latent z).")
-        elif self.attack_type == 'steal_decoder':
-            # Match the final output Y (reconstruction or classification)
-            task = self.surrogate_model_config.get('task', 'reconstruction')
-            if task == 'reconstruction':
-                self.surrogate_criterion = nn.MSELoss() # Match reconstructed images
-                print("Using MSE loss for stealing reconstruction decoder.")
-            elif task == 'classification':
-                 # Match the *logits* or use KL divergence for probabilities
-                 # Using CrossEntropy assumes victim outputs labels, which it doesn't via query.
-                 # MSE on logits is a common approach. KL divergence is better if victim provided probabilities.
-                 self.surrogate_criterion = nn.MSELoss() # Match output logits
-                 # self.surrogate_criterion = nn.KLDivLoss(reduction='batchmean') # Requires log_softmax on surrogate, softmax on victim
-                 print("Using MSE loss for stealing classification decoder (matching logits).")
-        elif self.attack_type == 'steal_end2end':
-            # Match the final output Y
-            task = self.surrogate_model_config.get('task', 'reconstruction')
-            if task == 'reconstruction':
-                 self.surrogate_criterion = nn.MSELoss()
-                 print("Using MSE loss for stealing end-to-end reconstruction.")
-            elif task == 'classification':
-                 self.surrogate_criterion = nn.MSELoss() # Match logits
-                 print("Using MSE loss for stealing end-to-end classification (matching logits).")
-        else:
-             raise ValueError(f"Cannot set loss for attack type: {self.attack_type}")
 
+    # Remove _setup_surrogate_loss method - logic moved to init
 
     def collect_data_batch(self, batch_size: int):
         """Queries the victim for one batch of data using the current strategy."""
@@ -211,140 +153,130 @@ class ModelStealingAttacker:
 
         effective_batch_size = min(batch_size, remaining_budget)
 
-        # 1. Get query inputs based on access type
-        if self.query_access == 'encoder_query' or self.query_access == 'end_to_end_query':
-             query_input = self.query_strategy.get_queries(effective_batch_size, self.device)
-             if query_input.size(0) < effective_batch_size: # Handle smaller last batch from strategy
-                 effective_batch_size = query_input.size(0)
-                 if effective_batch_size == 0: return False # Strategy exhausted?
+        # 1. Get query inputs (X)
+        # Requires query_access that takes X as input
+        if self.query_access not in ['encoder_query', 'end_to_end_query']:
+             raise ValueError(f"Cannot steal encoder with query_access '{self.query_access}'. Needs 'encoder_query' or 'end_to_end_query'.")
 
-        elif self.query_access == 'decoder_query':
-             # Attacker needs to generate z' inputs. How?
-             # Option 1: Randomly sample from a prior distribution (e.g., Gaussian)
-             # Option 2: Use the surrogate encoder (if available/trained) on proxy data
-             # Let's use Option 1 for simplicity now.
-             latent_dim = self.surrogate_model_config['latent_dim']
-             query_input = torch.randn(effective_batch_size, latent_dim, device=self.device)
-             # TODO: Implement more sophisticated z' generation if needed
-        else:
-             raise ValueError("Invalid query access for data collection")
+        query_input_x = self.query_strategy.get_queries(effective_batch_size, self.device)
+        if query_input_x.size(0) == 0: return False # Strategy exhausted?
+        effective_batch_size = query_input_x.size(0) # Adjust if last batch was smaller
 
         # 2. Query the victim
-        victim_output_package = self.victim_interface.query(query_input)
+        victim_output_package = self.victim_interface.query(query_input_x)
 
-        if victim_output_package is None: # Budget might have been exactly hit
+        if victim_output_package is None: # Budget might have been exactly hit or error
+            print("Warning: Victim query returned None. Budget might be hit or interface error.")
             return False
 
-        # 3. Store the data pair(s) - Adjust based on return format of query interface
-        if self.latent_access == 'none':
-            # Store (query_input, primary_output)
-            self.collected_data.append((query_input.cpu(), victim_output_package.cpu()))
-        else: # Grey-box returns tuple (primary_output, latent)
-            primary_output, latent = victim_output_package
-            self.collected_data.append((query_input.cpu(), primary_output.cpu(), latent.cpu()))
+        # 3. Store the data pair(s) - We need (X, z_observed)
+        # The interface now returns (primary_output, observed_latent) or just primary_output
+        if isinstance(victim_output_package, tuple) and len(victim_output_package) == 2:
+            _, observed_latent_z = victim_output_package # Discard primary_output, keep observed_latent
+            if observed_latent_z is None:
+                 print("Warning: Query returned tuple but observed_latent is None. Skipping batch.")
+                 return True # Allow continuing collection, but this batch is lost
+        elif self.latent_access == 'clean_z' and self.query_access == 'encoder_query':
+             # Special case: encoder_query with clean_z access (no tuple returned by default)
+             observed_latent_z = victim_output_package # The primary output *is* clean_z
+        else:
+            print(f"Warning: Unexpected victim output format or missing latent. Type: {type(victim_output_package)}. Skipping batch.")
+            # Attempt to get query count to see if budget was the issue
+            print(f"Current query count: {self.victim_interface.get_query_count()} / {self.query_budget}")
+            return True # Allow continuing collection maybe? Or return False? Let's continue but log.
+
+
+        # Store (query_input_X, observed_latent_z)
+        self.collected_data.append((query_input_x.cpu(), observed_latent_z.cpu()))
 
         return True # Data collected successfully
 
     def create_surrogate_dataset(self) -> Dataset:
-        """Creates a PyTorch Dataset from the collected data."""
+        """Creates a PyTorch Dataset from the collected (X, z_observed) data."""
         if not self.collected_data:
+            print("No data collected for surrogate training.")
             return None
 
-        # Unzip the collected data
-        # Note: The structure depends on the attack type and latent access
-        inputs = []
-        targets = []
+        # Unzip the collected data: list of (X_batch, z_observed_batch) tuples
+        inputs_x = []
+        targets_z = []
+        for x, z_observed in self.collected_data:
+            inputs_x.append(x)
+            targets_z.append(z_observed)
 
-        if self.attack_type == 'steal_encoder':
-            # Input: X (from query_input), Target: Z_victim (from latent access or primary output)
-            if self.latent_access == 'clean_z' or self.query_access == 'encoder_query':
-                for x, _, z_v in self.collected_data: inputs.append(x); targets.append(z_v)
-                # Special case: encoder_query, latent_access=none. Primary output is z.
-                if self.latent_access == 'none' and self.query_access == 'encoder_query':
-                     for x, z_v in self.collected_data: inputs.append(x); targets.append(z_v)
-            else: raise ValueError("Cannot steal encoder without clean_z access or direct encoder query.")
-
-        elif self.attack_type == 'steal_decoder':
-             # Input: Z' (from query_input or latent access), Target: Y_victim (primary output)
-             if self.query_access == 'decoder_query': # Input was z' (or z)
-                 if self.latent_access == 'none':
-                     for z_prime_in, y_v in self.collected_data: inputs.append(z_prime_in); targets.append(y_v)
-                 elif self.latent_access == 'dirty_z_prime': # Input was z', also returned as latent
-                     for z_prime_in, y_v, z_prime_latent in self.collected_data: inputs.append(z_prime_latent); targets.append(y_v)
-                 else: # Clean Z access with decoder query doesn't make sense for training
-                      raise ValueError("Cannot train steal_decoder surrogate with clean_z latent access via decoder_query.")
-             elif self.query_access == 'end_to_end_query' and self.latent_access == 'dirty_z_prime':
-                  # Input X, got Y and Z'. Train surrogate on Z' -> Y
-                  for x, y_v, z_prime_latent in self.collected_data: inputs.append(z_prime_latent); targets.append(y_v)
-             else: raise ValueError("Cannot steal decoder without decoder_query or end_to_end + dirty_z access.")
-
-        elif self.attack_type == 'steal_end2end':
-             # Input: X (from query_input), Target: Y_victim (primary output)
-             if self.latent_access == 'none':
-                 for x, y_v in self.collected_data: inputs.append(x); targets.append(y_v)
-             else: # Grey-box also returns Y
-                  for x, y_v, _ in self.collected_data: inputs.append(x); targets.append(y_v)
-        else:
-             raise ValueError(f"Unknown attack type: {self.attack_type}")
-
-
-        if not inputs:
-             print("Warning: No suitable data collected for training the surrogate based on config.")
+        if not inputs_x:
+             print("Warning: Failed to extract data for surrogate dataset.")
              return None
 
-        inputs_tensor = torch.cat(inputs, dim=0)
-        targets_tensor = torch.cat(targets, dim=0)
+        inputs_tensor = torch.cat(inputs_x, dim=0)
+        targets_tensor = torch.cat(targets_z, dim=0)
+        print(f"Created surrogate dataset with {inputs_tensor.size(0)} samples.")
         return TensorDataset(inputs_tensor, targets_tensor)
 
 
     def train_surrogate(self, epochs: int, batch_size: int):
-        """Trains the surrogate model using the collected data."""
-        print("\n--- Training Surrogate Model ---")
+        """Trains the surrogate ENCODER model using the collected data."""
+        print("\n--- Training Surrogate Encoder ---")
         surrogate_dataset = self.create_surrogate_dataset()
-        if surrogate_dataset is None:
-            print("No data available to train surrogate. Skipping.")
+        if surrogate_dataset is None or len(surrogate_dataset) == 0:
+            print("No data available to train surrogate encoder. Skipping.")
             return
 
         surrogate_loader = DataLoader(surrogate_dataset, batch_size=batch_size, shuffle=True)
-        print(f"Created surrogate dataset with {len(surrogate_dataset)} samples.")
+        print(f"Training surrogate encoder on {len(surrogate_dataset)} samples for {epochs} epochs.")
+
+        # Ensure the correct model is being trained
+        self.surrogate_encoder.train()
 
         for epoch in range(1, epochs + 1):
              epoch_start_time = time.time()
+             # Pass the surrogate encoder to the training function
              avg_loss = train_surrogate_epoch(
-                 self.surrogate_model,
-                 surrogate_loader,
-                 self.surrogate_optimizer,
-                 self.surrogate_criterion,
-                 self.device,
-                 self.attack_type # Pass attack type if loss needs it
+                 model=self.surrogate_encoder, # Pass the encoder
+                 loader=surrogate_loader,
+                 optimizer=self.surrogate_optimizer,
+                 criterion=self.surrogate_criterion,
+                 device=self.device,
+                 attack_type=self.attack_type, # Still useful for potential logging/logic inside train_epoch
+                 # task='latent_matching' # Can add more specific task info if needed
              )
              epoch_duration = time.time() - epoch_start_time
-             print(f"Surrogate Train Epoch {epoch}/{epochs} | Time: {epoch_duration:.2f}s | Avg Loss: {avg_loss:.4f}")
+             print(f"Surrogate Encoder Train Epoch {epoch}/{epochs} | Time: {epoch_duration:.2f}s | Avg Loss: {avg_loss:.6f}")
              # TODO: Add evaluation on a hold-out set of collected data if desired
 
-        print("--- Surrogate Training Finished ---")
+        print("--- Surrogate Encoder Training Finished ---")
+        self.surrogate_encoder.eval() # Set back to eval mode after training
 
     def run_attack(self):
-        """Executes the full attack sequence: collect data and train surrogate."""
-        print("\n--- Running Model Stealing Attack ---")
+        """Executes the attack: collect data and train surrogate encoder."""
+        print("\n--- Running Model Stealing Attack (Encoder Focus) ---")
         queries_per_step = self.attacker_train_config.get('query_batch_size', 128)
-        max_epochs = self.attacker_train_config.get('epochs', 10) # Can be fixed or adaptive
+        max_epochs = self.attacker_train_config.get('epochs', 10)
 
         # --- Data Collection Phase ---
         print("Starting data collection...")
         pbar = tqdm(total=self.query_budget, desc="Queries")
         initial_count = self.victim_interface.get_query_count()
+        collected_samples = 0
         while self.victim_interface.get_query_count() < self.query_budget:
              success = self.collect_data_batch(queries_per_step)
              current_count = self.victim_interface.get_query_count()
-             pbar.update(current_count - initial_count)
+             delta_count = current_count - initial_count
+             pbar.update(delta_count)
+             if success and delta_count > 0 and self.collected_data:
+                 # Estimate collected samples based on last batch size added
+                 collected_samples += self.collected_data[-1][0].size(0)
              initial_count = current_count
-             if not success:
-                 print("Data collection stopped (budget reached or error).")
+             if not success and self.victim_interface.get_query_count() >= self.query_budget:
+                 # Expected stop due to budget
                  break
+             elif not success:
+                  # Unexpected stop (e.g., query error, strategy exhausted)
+                  print("\nData collection stopped potentially before budget reached.")
+                  break
         pbar.close()
-        print(f"Data collection finished. Total queries made: {self.victim_interface.get_query_count()}")
-        print(f"Collected {len(self.collected_data)} batches of data.")
+        print(f"Data collection finished. Total queries used: {self.victim_interface.get_query_count()} / {self.query_budget}")
+        print(f"Collected {len(self.collected_data)} batches, approx {collected_samples} (X, z_observed) pairs.") # Adjusted log
 
         # --- Training Phase ---
         if self.collected_data:
@@ -353,108 +285,52 @@ class ModelStealingAttacker:
                  batch_size=self.attacker_train_config.get('batch_size', 128)
              )
         else:
-             print("No data collected, cannot train surrogate.")
+             print("No data collected, cannot train surrogate encoder.")
 
         print("--- Attack Finished ---")
 
     def evaluate_attack(self, test_loader: DataLoader) -> dict:
         """
-        Evaluates the success of the attack.
+        Evaluates the success of the attack by measuring surrogate encoder fidelity.
 
         Args:
-            test_loader (DataLoader): The *original* test dataset loader
-                                     (used to evaluate task performance).
+            test_loader (DataLoader): The *original* test dataset loader.
 
         Returns:
-            dict: Dictionary containing evaluation metrics.
+            dict: Dictionary containing encoder fidelity metrics (e.g., latent_mse, latent_cosine_similarity).
         """
-        print("\n--- Evaluating Attack Success ---")
+        print("\n--- Evaluating Attack Success (Encoder Fidelity) ---")
         results = {}
-        task = self.surrogate_model_config.get('task', 'reconstruction') # Get task from surrogate config
 
-        # 1. Evaluate Surrogate Fidelity (Model Agreement or Output Similarity)
-        print("Evaluating surrogate fidelity...")
+        # We only evaluate fidelity for steal_encoder
+        print("Evaluating surrogate encoder fidelity vs victim encoder...")
+
+        # Ensure surrogate is in eval mode
+        self.surrogate_encoder.eval()
+
+        # Pass the actual victim encoder and surrogate encoder to the evaluation function
+        # The victim_interface holds the victim_model which has the encoder
+        if not hasattr(self.victim_interface.victim_model, 'encoder'):
+             print("Error: Victim model in interface does not have an 'encoder' attribute.")
+             return {"error": "Victim encoder not accessible"}
+        if not hasattr(self, 'surrogate_encoder'):
+            print("Error: Attacker does not have a 'surrogate_encoder' attribute.")
+            return {"error": "Surrogate encoder not found"}
+
+
         fidelity_metrics = evaluate_surrogate_fidelity(
-            self.victim_interface, # Needs access to victim for comparison
-            self.surrogate_model,
-            test_loader, # Use original test data as input
-            self.device,
-            task,
-            self.attack_type, # Need this to know how to query victim/surrogate
-            self.latent_access # Need this potentially for grey-box comparison
+            victim_encoder=self.victim_interface.victim_model.encoder, # Pass victim's actual encoder
+            surrogate_encoder=self.surrogate_encoder,                  # Pass surrogate encoder
+            test_loader=test_loader,
+            device=self.device,
+            # task=self.surrogate_model_config.get('task', 'reconstruction') # Task isn't directly relevant for z comparison
+            # attack_type=self.attack_type # Implicitly steal_encoder
+            # latent_access=self.latent_access # Not needed for final Z vs Z comparison
         )
         results.update(fidelity_metrics)
 
-        # 2. Evaluate Surrogate Task Performance
-        # Run surrogate model on the original test set and calculate task metrics
-        print("Evaluating surrogate task performance...")
-        self.surrogate_model.eval()
-        surrogate_task_eval = {}
-        if self.attack_type == 'steal_encoder':
-             print("Task performance evaluation not applicable for 'steal_encoder' attack.")
-             pass # Cannot evaluate task performance with just an encoder
-        elif self.attack_type == 'steal_decoder':
-             # Need a way to get representative z' for the test set.
-             # Option 1: Use victim encoder on test set + channel -> feed to surrogate decoder
-             # Option 2: Sample random z' (less realistic)
-             # Let's try Option 1 (requires victim encoder access conceptually)
-             print("Evaluating surrogate decoder task performance (requires victim encoder + channel)...")
-             all_targets = []
-             all_surrogate_outputs = []
-             with torch.no_grad():
-                 for data, target in tqdm(test_loader, desc="Surrogate Decoder Eval", leave=False):
-                     data = data.to(self.device)
-                     z = self.victim_interface.victim_model.encode(data) # Get clean z
-                     self.victim_interface.victim_model.channel.eval() # Ensure channel is eval
-                     z_prime = self.victim_interface.victim_model.channel(z) # Simulate channel
-                     y_surrogate = self.surrogate_model(z_prime) # Use surrogate decoder
-                     all_targets.append(target.cpu())
-                     all_surrogate_outputs.append(y_surrogate.cpu())
+        # Task performance is not evaluated as we only stole the encoder
+        print("Surrogate task performance evaluation is N/A for 'steal_encoder'.")
 
-             all_targets = torch.cat(all_targets)
-             all_surrogate_outputs = torch.cat(all_surrogate_outputs)
-
-             if task == 'classification':
-                  acc, _ = calculate_accuracy(all_surrogate_outputs, all_targets)
-                  surrogate_task_eval['surrogate_task_accuracy'] = acc
-             elif task == 'reconstruction':
-                  # Need original images for comparison
-                  all_original_data = []
-                  for data, _ in test_loader: all_original_data.append(data)
-                  all_original_data = torch.cat(all_original_data)
-                  psnr = calculate_psnr(all_surrogate_outputs, all_original_data, data_range=2.0)
-                  surrogate_task_eval['surrogate_task_psnr'] = psnr
-                  # Add SSIM/LPIPS here if needed
-
-        elif self.attack_type == 'steal_end2end':
-             # Directly evaluate surrogate on test set
-             all_targets = []
-             all_surrogate_outputs = []
-             with torch.no_grad():
-                 for data, target in tqdm(test_loader, desc="Surrogate E2E Eval", leave=False):
-                      data = data.to(self.device)
-                      y_surrogate = self.surrogate_model(data)
-                      all_targets.append(target.cpu())
-                      all_surrogate_outputs.append(y_surrogate.cpu())
-             all_targets = torch.cat(all_targets)
-             all_surrogate_outputs = torch.cat(all_surrogate_outputs)
-
-             if task == 'classification':
-                  acc, _ = calculate_accuracy(all_surrogate_outputs, all_targets)
-                  surrogate_task_eval['surrogate_task_accuracy'] = acc
-             elif task == 'reconstruction':
-                  all_original_data = []
-                  for data, _ in test_loader: all_original_data.append(data)
-                  all_original_data = torch.cat(all_original_data)
-                  psnr = calculate_psnr(all_surrogate_outputs, all_original_data, data_range=2.0)
-                  surrogate_task_eval['surrogate_task_psnr'] = psnr
-                  # Add SSIM/LPIPS here if needed
-
-        results.update(surrogate_task_eval)
-        print(f"Attack Evaluation Results: {results}")
+        print(f"Attack Evaluation Results (Encoder Fidelity): {results}")
         return results
-
-
-# NOTE: Need to implement train_surrogate_epoch and evaluate_surrogate_fidelity
-# in training/train_attacker.py and evaluation/metrics.py (or keep fidelity eval here).
-# Let's put helper train/eval for surrogate in a separate file for clarity.
